@@ -1,0 +1,25 @@
+[project]
+name = "tw-einvoice-ocr"
+version = "0.1.0"
+description = "台灣電子發票/收據結構化辨識：QR解碼優先、OCR備援、賣方類別學習。從 Intpure Fin 財務助理拆出的可重用引擎，不綁特定儲存/介面。"
+requires-python = ">=3.10"
+readme = "README.md"
+dependencies = [
+    "pillow>=10.0",
+    "zxing-cpp>=2.2",
+]
+
+[project.optional-dependencies]
+ocr = [
+    "pytesseract>=0.3.10",
+    "pymupdf>=1.23",
+    "opencv-python-headless>=4.8",
+    "numpy>=1.24",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tw_einvoice_ocr*"]
