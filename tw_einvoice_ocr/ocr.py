@@ -157,9 +157,51 @@ def _deskew(gray):
                           borderMode=cv2.BORDER_REPLICATE)
 
 
+def _crop_to_document(gray):
+    """找畫面中最大的高對比矩形區域（收據本體）並裁切，濾掉背景紋理（木紋桌面等）
+    干擾後續 adaptive threshold——實測用真實 Aqua 收據照片發現：桌面木紋在二值化
+    後會變成大量黑線噪點，蓋掉收據本身的文字（見借用紀錄.md 082 相關 commit）。
+
+    深色背景（木紋桌）對比夠、效果好；偵測到的輪廓面積太小（雜訊）或太接近
+    全圖（代表本來就沒有背景可裁，例如手機截圖）都保守跳過不裁，回傳原圖。
+
+    ponytail: 只做「找最大輪廓裁切」，不做透視校正（四邊拉直）——現有 _deskew
+    只校旋轉角度已經夠用，真遇到大角度透視變形的照片才需要再加 warpPerspective。
+    實測發現邊緣偵測（Canny+膨脹）會被木紋本身的線條邊緣誤導成一個蓋滿全圖的
+    假輪廓，改用亮度二值化（收據白紙 vs 深色木桌對比夠大）+腐蝕斷開跟反光
+    亮點的細橋才穩定抓到收據本體（見借用紀錄.md 082 相關 commit）。
+    """
+    import cv2
+    import numpy as np
+
+    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    eroded = cv2.erode(mask, np.ones((25, 25), np.uint8))
+    contours, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return gray
+
+    largest = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest)
+    h, w = gray.shape
+    frame_area = h * w
+    if area < frame_area * 0.15 or area > frame_area * 0.92:
+        return gray
+
+    x, y, cw, ch = cv2.boundingRect(largest)
+    pad = 30
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(w, x + cw + pad), min(h, y + ch + pad)
+    return gray[y0:y1, x0:x1]
+
+
 def scan_document(pil_img):
-    """收據專用前處理：CLAHE 對比增強 -> 去噪 -> 旋轉校正 -> 自適應二值化。
-    輸入 PIL.Image，回傳前處理後的 PIL.Image（灰階）。
+    """收據專用前處理：裁切出收據本體 -> CLAHE 對比增強 -> 去噪 -> 旋轉校正 ->
+    自適應二值化。輸入 PIL.Image，回傳前處理後的 PIL.Image（灰階）。
+
+    裁切一定要在 CLAHE 之前做：CLAHE 是局部對比增強，會把背景木紋的明暗差異
+    也跟著放大，讓亮度二值化找收據輪廓時把背景紋理誤併進來（實測發現，見
+    `_crop_to_document` docstring）；裁切用原始灰階的全域亮度對比反而最穩定。
     """
     import cv2
     import numpy as np
@@ -167,8 +209,10 @@ def scan_document(pil_img):
 
     gray = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2GRAY)
 
+    cropped_raw = _crop_to_document(gray)
+
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
+    enhanced = clahe.apply(cropped_raw)
 
     denoised = cv2.fastNlMeansDenoising(enhanced, h=10,
                                         templateWindowSize=7,
