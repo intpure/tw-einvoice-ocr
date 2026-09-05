@@ -23,6 +23,8 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 
+from . import layout
+
 # ──────────────────────────────────────────────
 # 正則：台灣收據 / 發票欄位
 # ──────────────────────────────────────────────
@@ -220,6 +222,33 @@ def _tesseract_image(img) -> str:
     return text.strip()
 
 
+def _tesseract_words(img) -> list[dict]:
+    """image_to_data() 逐字輸出，保留 bounding box——供 layout.py 做行聚類，
+    避免像 image_to_string 一樣把版面拉平成一段文字後失去欄位對應關係。
+    """
+    try:
+        import pytesseract
+    except ImportError:
+        raise RuntimeError("需要 pytesseract：pip install tw-einvoice-ocr[ocr]")
+
+    processed = _preprocess(img)
+    data = pytesseract.image_to_data(
+        processed, lang=_TESS_LANG, config=_TESS_CONFIG, output_type=pytesseract.Output.DICT
+    )
+    n = len(data["text"])
+    return [
+        {
+            "text": data["text"][i],
+            "left": data["left"][i],
+            "top": data["top"][i],
+            "width": data["width"][i],
+            "height": data["height"][i],
+        }
+        for i in range(n)
+        if data["text"][i].strip()
+    ]
+
+
 def ocr_image(image_path: str) -> str | None:
     from PIL import Image
     img = Image.open(image_path)
@@ -227,8 +256,26 @@ def ocr_image(image_path: str) -> str | None:
     return text or None
 
 
+def ocr_image_rows(image_path: str) -> list[list[dict]]:
+    """跟 ocr_image() 同一張圖，但回傳版面結構（行聚類後的 word 列表）而非拉平文字。"""
+    from PIL import Image
+    img = Image.open(image_path)
+    words = _tesseract_words(img)
+    return layout.group_words_into_rows(words)
+
+
 def ocr_pdf(pdf_path: str) -> str | None:
     """PDF -> 逐頁以 pymupdf 轉圖 -> Tesseract OCR -> 合併全文。每頁 2x 縮放確保解析度。"""
+    all_rows = _ocr_pdf_rows(pdf_path)
+    if not all_rows:
+        return None
+    return layout.rows_to_text(all_rows)
+
+
+def _ocr_pdf_rows(pdf_path: str) -> list[list[dict]]:
+    """PDF 逐頁 OCR 後回傳版面結構。行聚類逐頁各自做（避免不同頁的座標互相干擾），
+    結果依頁面順序串接。
+    """
     try:
         import fitz
     except ImportError:
@@ -237,16 +284,19 @@ def ocr_pdf(pdf_path: str) -> str | None:
     import io
 
     doc = fitz.open(pdf_path)
-    all_text: list[str] = []
+    all_rows: list[list[dict]] = []
     for page in doc:
         mat = fitz.Matrix(2, 2)
         pix = page.get_pixmap(matrix=mat)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
-        page_text = _tesseract_image(img)
-        if page_text:
-            all_text.append(page_text)
+        words = _tesseract_words(img)
+        all_rows.extend(layout.group_words_into_rows(words))
     doc.close()
-    return "\n".join(all_text) if all_text else None
+    return all_rows
+
+
+def ocr_pdf_rows(pdf_path: str) -> list[list[dict]]:
+    return _ocr_pdf_rows(pdf_path)
 
 
 def ocr_url(url: str) -> str | None:
@@ -304,22 +354,15 @@ def _extract_amount(text: str) -> tuple[int | None, float]:
     return None, 0.0
 
 
-def _extract_three_amounts(text: str) -> tuple[int | None, int | None, int | None]:
-    """從 OCR 文字擷取三欄金額：tax_inclusive(含稅)/tax_exclusive(未稅)/tax_amount(稅額)。
-    策略：三欄都抓到就驗證 5% 稅率平衡；只抓到其中一欄就用 5% 稅率反推其餘兩欄。
+def _balance_three_amounts(
+    tax_inclusive: int | None, tax_exclusive: int | None, tax_amount: int | None,
+    fallback_amount: int | None = None,
+) -> tuple[int | None, int | None, int | None]:
+    """三欄（含稅/未稅/稅額）不論抓到幾欄，用 5% 稅率補齊剩下的欄位。
+    抓不到任何一欄時，用 fallback_amount（例如全文最大數字）當含稅金額推算。
+    這段平衡邏輯跟「文字是怎麼抓到這三個候選值的」無關，flat-text 版跟
+    row-scoped 版共用同一份，避免兩份邏輯各改一次漂移。
     """
-    tax_inclusive = tax_exclusive = tax_amount = None
-
-    m = _RE_AMOUNT_TOTAL.search(text)
-    if m:
-        tax_inclusive = int(m.group(1).replace(",", ""))
-    m = _RE_AMOUNT_UNTAXED.search(text)
-    if m:
-        tax_exclusive = int(m.group(1).replace(",", ""))
-    m = _RE_AMOUNT_TAX.search(text)
-    if m:
-        tax_amount = int(m.group(1).replace(",", ""))
-
     if tax_inclusive is not None and tax_exclusive is not None and tax_amount is not None:
         expected_tax = round(tax_exclusive * 0.05)
         expected_inclusive = tax_exclusive + expected_tax
@@ -345,14 +388,36 @@ def _extract_three_amounts(text: str) -> tuple[int | None, int | None, int | Non
         tax_inclusive = tax_exclusive + tax_amount
         return tax_inclusive, tax_exclusive, tax_amount
 
-    amount, _ = _extract_amount(text)
-    if amount is not None:
-        tax_inclusive = amount
-        tax_exclusive = round(amount / 1.05)
+    if fallback_amount is not None:
+        tax_inclusive = fallback_amount
+        tax_exclusive = round(fallback_amount / 1.05)
         tax_amount = tax_inclusive - tax_exclusive
         return tax_inclusive, tax_exclusive, tax_amount
 
     return None, None, None
+
+
+def _extract_three_amounts(text: str) -> tuple[int | None, int | None, int | None]:
+    """從 OCR 全文擷取三欄金額：tax_inclusive(含稅)/tax_exclusive(未稅)/tax_amount(稅額)。
+    在拉平文字上全文搜尋——找的三個候選值可能分別來自文件裡不同的表格列，
+    金額之間的關聯只靠 5% 稅率數學驗證，不靠版面位置。多欄同時出現在複雜表格
+    時可能抓到不相關列的數字（見 parse_receipt_rows 的 row-scoped 版本）。
+    """
+    tax_inclusive = tax_exclusive = tax_amount = None
+    m = _RE_AMOUNT_TOTAL.search(text)
+    if m:
+        tax_inclusive = int(m.group(1).replace(",", ""))
+    m = _RE_AMOUNT_UNTAXED.search(text)
+    if m:
+        tax_exclusive = int(m.group(1).replace(",", ""))
+    m = _RE_AMOUNT_TAX.search(text)
+    if m:
+        tax_amount = int(m.group(1).replace(",", ""))
+
+    fallback_amount = None
+    if tax_inclusive is None and tax_exclusive is None and tax_amount is None:
+        fallback_amount, _ = _extract_amount(text)
+    return _balance_three_amounts(tax_inclusive, tax_exclusive, tax_amount, fallback_amount)
 
 
 def _extract_tax_id(text: str) -> tuple[str | None, str | None]:
@@ -453,19 +518,140 @@ def parse_receipt_text(text: str, source: str = "photo") -> dict:
     }
 
 
+def _extract_date_rows(rows: list[list[dict]]) -> tuple[str | None, float]:
+    for row in rows:
+        text = layout.row_text(row)
+        m = _RE_DATE_AD.search(text)
+        if m:
+            y, mo, d = m.groups()
+            if 2000 <= int(y) <= 2099:
+                return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}", 0.9
+        m = _RE_DATE_ROC.search(text)
+        if m:
+            return _roc_to_ad(*m.groups()), 0.85
+        m = _RE_DATE_ROC2.search(text)
+        if m:
+            return _roc_to_ad(*m.groups()), 0.80
+    return None, 0.0
+
+
+def _extract_three_amounts_rows(rows: list[list[dict]]) -> tuple[int | None, int | None, int | None]:
+    """跟 _extract_three_amounts 找同樣三個欄位，但每個 pattern 只在單一視覺行內
+    搜尋——這是本模組相對於全文版的核心差異，直接對應 docling「先建結構再抽欄位」
+    的原則：label 跟它的數值要在同一行才算數，不會被別的表格列的數字帶偏。
+    """
+    tax_inclusive = tax_exclusive = tax_amount = None
+    m = layout.find_value_in_labeled_row(rows, ("總計", "合計", "含稅", "消費金額"), _RE_AMOUNT_TOTAL)
+    if m:
+        mm = _RE_AMOUNT_TOTAL.search(m)
+        tax_inclusive = int(mm.group(1).replace(",", "")) if mm else None
+    m = layout.find_value_in_labeled_row(rows, ("未稅", "小計", "營業額", "銷售額"), _RE_AMOUNT_UNTAXED)
+    if m:
+        mm = _RE_AMOUNT_UNTAXED.search(m)
+        tax_exclusive = int(mm.group(1).replace(",", "")) if mm else None
+    m = layout.find_value_in_labeled_row(rows, ("營業稅", "稅額", "稅金"), _RE_AMOUNT_TAX)
+    if m:
+        mm = _RE_AMOUNT_TAX.search(m)
+        tax_amount = int(mm.group(1).replace(",", "")) if mm else None
+
+    fallback_amount = None
+    if tax_inclusive is None and tax_exclusive is None and tax_amount is None:
+        fallback_amount, _ = _extract_amount(layout.rows_to_text(rows))
+    return _balance_three_amounts(tax_inclusive, tax_exclusive, tax_amount, fallback_amount)
+
+
+def parse_receipt_rows(rows: list[list[dict]], source: str = "photo") -> dict:
+    """跟 parse_receipt_text 輸出同一種 draft dict schema，但金額/日期用
+    row-scoped（同一視覺行內）擷取——版面/表格結構感知，比全文正則更不容易
+    抓到不相關表格列的數字。invoice_no/統編/付款方式/類別等欄位沒有這個
+    「抓錯格」風險，沿用既有的全文正則即可，不用重寫。
+    """
+    text = layout.rows_to_text(rows)
+
+    inv_m = _RE_INV_NO.search(text)
+    inv_no = inv_m.group(1) if inv_m else None
+
+    date, date_conf = _extract_date_rows(rows)
+    if date is None:
+        date = datetime.now().strftime("%Y-%m-%d")
+        date_conf = 0.3
+
+    buyer_id, seller_id = _extract_tax_id(text)
+    payment = _extract_payment(text)
+    category = _guess_category(text)
+
+    if seller_id:
+        counterparty = f"賣方統編 {seller_id}"
+    else:
+        first_line = layout.row_text(rows[0])[:20] if rows else "未知"
+        counterparty = first_line or "未知"
+
+    if buyer_id or seller_id:
+        inv_status = "有(含統編)" if buyer_id else "有(無統編)"
+    else:
+        inv_status = "有(無統編)" if inv_no else "無"
+
+    tax_inclusive, tax_exclusive, tax_amount = _extract_three_amounts_rows(rows)
+    if tax_inclusive is None:
+        tax_inclusive = tax_exclusive = tax_amount = 0
+        amt_conf = 0.3
+    else:
+        amt_conf = 0.75  # row-scoped 命中，信心比全文版略高（結構確認過 label 對應）
+
+    confidence = round(min(date_conf, amt_conf, 0.85), 2)
+
+    note_parts = []
+    if inv_no:
+        note_parts.append(f"發票 {inv_no}")
+    note = " ".join(note_parts)
+
+    return {
+        "date": date,
+        "direction": "支出",
+        "payment_method": payment,
+        "counterparty": counterparty,
+        "category": category,
+        "tax_inclusive": tax_inclusive,
+        "tax_exclusive": tax_exclusive,
+        "tax_amount": tax_amount,
+        "amount_incl_tax": tax_inclusive,
+        "invoice_status": inv_status,
+        "evidence_url": None,
+        "note": note,
+        "status": "待審",
+        "confidence": confidence,
+        "source": source,
+        "_ocr_raw_snippet": text[:300].replace("\n", " "),
+    }
+
+
 def ocr_to_draft(source: str, draft_source_tag: str = "photo") -> dict | None:
     """主入口：接受本機路徑（圖片/PDF）或 URL（含 OneDrive 連結）。
-    回傳 draft dict；OCR 失敗回 None。
+    優先用版面結構（row-scoped）解析；抓不到任何金額才退回全文正則
+    （沿用 parse_receipt_text，涵蓋版面辨識失敗或非典型排版的情況）。
+    OCR 失敗（讀不到任何文字）回 None。
     """
     if source.startswith("http://") or source.startswith("https://"):
-        text = ocr_url(source)
+        tmp_path, ctype = _download_to_tempfile(source)
+        try:
+            is_pdf = "pdf" in ctype or tmp_path.endswith(".pdf")
+            rows = _ocr_pdf_rows(tmp_path) if is_pdf else ocr_image_rows(tmp_path)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     else:
         path_lower = source.lower()
-        if path_lower.endswith(".pdf"):
-            text = ocr_pdf(source)
-        else:
-            text = ocr_image(source)
+        rows = _ocr_pdf_rows(source) if path_lower.endswith(".pdf") else ocr_image_rows(source)
 
-    if not text:
+    if not rows:
         return None
+
+    draft = parse_receipt_rows(rows, source=draft_source_tag)
+    if draft["tax_inclusive"]:
+        return draft
+
+    # row-scoped 沒抓到任何金額（版面太不規則、或行聚類切錯）——退回全文正則再試一次。
+    text = layout.rows_to_text(rows)
     return parse_receipt_text(text, source=draft_source_tag)

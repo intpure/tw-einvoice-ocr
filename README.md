@@ -40,6 +40,15 @@ draft = ocr.ocr_to_draft("receipt.jpg")   # 或傳 URL（含 OneDrive 分享連�
 # draft 為 None 代表 OCR 也讀不出文字
 ```
 
+`ocr_to_draft()` 內部優先用**版面結構感知**（`layout.py`）解析金額/日期：先用
+Tesseract 的逐字座標（`image_to_data`）把畫面聚類成「視覺行」，只在同一行內找
+標籤跟數值，不會被別的表格列裡文字上比較接近、但其實不相關的數字帶偏——這是
+參考 [docling](https://github.com/docling-project/docling)（IBM Research，
+MIT，見借用紀錄.md 082）「先建結構、再抽欄位」的架構原則做的輕量版，不引入
+docling 本身（其 DocLayNet/TableFormer 是需要 GPU/CPU 推論的深度學習模型，跟
+一支輕量 fallback 層不成比例），只借用原則、用既有依賴自己刻。行聚類抓不到任何
+金額時，才退回原本的全文正則（`parse_receipt_text`）當最後防線。
+
 ### 3. 賣方類別學習（多數決查表，非 ML）
 
 從你自己的歷史交易紀錄（哪裡來、怎麼存都可以，這裡只吃一個 dict list）學「這個
@@ -85,14 +94,23 @@ draft = invoice_to_draft(invoice, counterparty=hit and hit.get("counterparty"),
 
 ```bash
 python tests/test_core.py
+python tests/test_layout.py
 ```
 
-無框架、assert-based，涵蓋 QR 解碼、草稿映射、賣方學習查表、OCR 欄位解析。
+無框架、assert-based。`test_core.py` 涵蓋 QR 解碼、草稿映射、賣方學習查表、
+OCR 欄位解析；`test_layout.py` 涵蓋行聚類與 row-scoped 欄位擷取，並用一組對照
+測試重現「OCR reading-order 誤判時全文正則會抓錯表格列」的已知失敗模式，證明
+row-scoped 版本的必要性。兩者皆純資料/字串邏輯，不需要真的裝 Tesseract 引擎
+就能跑；`ocr_to_draft()` 實際呼叫 Tesseract 的路徑（`_tesseract_words`/
+`_tesseract_image`）需要系統裝好 Tesseract 5 才能端到端驗證。
 
 ## 已知限制
 
 - QR 解碼只認台灣財政部電子發票證明聯格式，其他國家/其他格式的收據 QR 不支援。
-- OCR 備援是規則式（正則+關鍵字），非通用 LLM 視覺辨識，遇到排版特殊的收據
-  信心值會偏低，設計上就是要讓人工確認，不是要做到全自動。
+- OCR 備援是規則式（正則+關鍵字+幾何行聚類），非通用 LLM 視覺辨識或深度學習
+  版面模型，遇到排版特殊的收據信心值會偏低，設計上就是要讓人工確認，不是要
+  做到全自動；行聚類目前只做「同一視覺行」等級的結構，不做跨行欄位對齊
+  （多欄明細表的品名/數量/單價/小計四欄對齊），真的遇到這類需求才是該考慮
+  導入 docling 本身的時機（見 layout.py 檔頭註解）。
 - 賣方類別學習是多數決查表，不是機器學習模型，冷啟動（沒有歷史紀錄）時一律
   留空給人工補。
